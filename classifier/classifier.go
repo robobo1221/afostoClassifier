@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
 	psqr "robin.stik/server/psqr"
 
 	database "robin.stik/server/database"
@@ -16,14 +18,16 @@ type Response struct {
 }
 
 type ResponseClassifier struct {
-	connectionName    string
-	maxPercentileMult float32
-	maxAbsoluteTime   int
-	include4xx        bool
-	currentResponse   Response
-	currentScore      float64
-	windowSize        int
-	previousScores    []float64 // To store previous 5 scores
+	connectionName       string
+	maxPercentileMult    float32
+	maxAbsoluteTime      int
+	include4xx           bool
+	currentResponse      Response
+	currentScore         float64
+	windowSize           int
+	previousScores       []float64 // To store previous 5 scores
+	previousMetricScores []float64
+	CurrentPromMetrics   PromMetrics
 }
 
 type ResponseClassifiers struct {
@@ -35,15 +39,72 @@ type classifyMiddleware struct {
 	classifier *ResponseClassifier
 }
 
+type PromMetrics struct {
+	// prometheus metrics
+	ResponseTime prometheus.Counter
+	ResponseCode prometheus.Histogram
+	Score        prometheus.Gauge
+}
+
+func sanitizeMetricName(name string) string {
+	// Replace '/' with '_'
+	sanitized := strings.ReplaceAll(name, "/", "_")
+	// Add more replacements if necessary
+	return sanitized
+}
+
+func NewPromMetrics(connectionName string) *PromMetrics {
+	sanitizedName := sanitizeMetricName(connectionName)
+
+	metrics := &PromMetrics{
+		ResponseTime: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: fmt.Sprintf("response_time_%s", sanitizedName),
+				Help: "Response time of the request",
+			},
+		),
+		ResponseCode: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    fmt.Sprintf("response_code_%s", sanitizedName),
+				Help:    "Response code of the request",
+				Buckets: []float64{200, 300, 400, 500, 600},
+			},
+		),
+		Score: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: fmt.Sprintf("score_%s", sanitizedName),
+				Help: "Score of the request",
+			},
+		),
+	}
+
+	fmt.Printf("Registered PromMetrics for %s: %+v\n", sanitizedName, metrics)
+
+	// Register the metrics with Prometheus
+	if err := prometheus.Register(metrics.ResponseTime); err != nil {
+		fmt.Printf("Error registering ResponseTime metric: %v\n", err)
+	}
+	if err := prometheus.Register(metrics.ResponseCode); err != nil {
+		fmt.Printf("Error registering ResponseCode metric: %v\n", err)
+	}
+	if err := prometheus.Register(metrics.Score); err != nil {
+		fmt.Printf("Error registering Score metric: %v\n", err)
+	}
+
+	return metrics
+}
+
 func NewResponseClassifier(connectionName string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int) *ResponseClassifier {
 	return &ResponseClassifier{
-		connectionName:    connectionName,
-		maxPercentileMult: maxPercentileMult,
-		maxAbsoluteTime:   maxAbsoluteTime,
-		include4xx:        include4xx,
-		currentResponse:   Response{time: 0, code: 0},
-		windowSize:        windowSize,
-		previousScores:    make([]float64, 0, 5), // Initialize slice for previous scores
+		connectionName:     connectionName,
+		maxPercentileMult:  maxPercentileMult,
+		maxAbsoluteTime:    maxAbsoluteTime,
+		include4xx:         include4xx,
+		currentResponse:    Response{time: 0, code: 0},
+		currentScore:       1.0,
+		windowSize:         windowSize,
+		previousScores:     make([]float64, 0, 5), // Initialize slice for previous scores
+		CurrentPromMetrics: *NewPromMetrics(connectionName),
 	}
 }
 
@@ -111,10 +172,14 @@ func (rc *ResponseClassifier) getPsqr(perc float64) (int, any, *psqr.Psqr) {
 }
 
 func (rc *ResponseClassifier) Classify() float64 {
+	defer rc.RecordMetrics()
+
 	// classify response
 	response := &rc.currentResponse
 	if response.code >= 400 && rc.include4xx || response.code >= 500 {
-		rc.currentScore = -2.0
+		newScore := -2.0
+		rc.currentScore = newScore
+
 		return rc.currentScore
 	}
 
@@ -155,11 +220,25 @@ func (rc *ResponseClassifier) Classify() float64 {
 	// Apply the low-pass filter to smooth the score
 	smoothedScore := rc.applyLowPassFilter(score)
 
-	fmt.Println(rc.previousScores)
-
 	rc.currentScore = smoothedScore
 
 	return rc.currentScore
+}
+
+func (rc *ResponseClassifier) ResetPrevScores() {
+	rc.previousMetricScores = []float64{}
+}
+
+func (rc *ResponseClassifier) RecordMetrics() {
+	rc.previousMetricScores = append(rc.previousMetricScores, rc.currentScore)
+
+	// Record the metrics to Prometheus
+
+	// Update Prometheus metrics
+	rc.CurrentPromMetrics.ResponseTime.Add(float64(rc.currentResponse.time))
+	rc.CurrentPromMetrics.ResponseCode.Observe(float64(rc.currentResponse.code))
+
+	rc.CurrentPromMetrics.Score.Set(average(rc.previousMetricScores))
 }
 
 func (rc *ResponseClassifier) registerPreviousData(id int, psqr *psqr.Psqr) {
@@ -186,8 +265,6 @@ func (rc *ResponseClassifier) RegisterData(psqr *psqr.Psqr) {
 		psqr.Np[0], psqr.Np[1], psqr.Np[2], psqr.Np[3], psqr.Np[4],
 		psqr.Dn[0], psqr.Dn[1], psqr.Dn[2], psqr.Dn[3], psqr.Dn[4],
 	)
-
-	// Register prometheus metrics
 }
 
 func (rc *ResponseClassifier) GetConnectionName() string {
@@ -225,19 +302,11 @@ func NewResponseClassifiersWithClassifiers(connections []string) {
 
 func (rcs *ResponseClassifiers) Dispatch(connection string) *ResponseClassifier {
 	// check if connection already exists
-	if _, ok := rcs.classifiers[connection]; ok {
-		classifier := rcs.classifiers[connection]
+	if classifier, ok := rcs.classifiers[connection]; ok {
 		return classifier
 	}
 
-	newClassifier := &ResponseClassifier{
-		connectionName:    connection,
-		maxPercentileMult: 1.5,
-		maxAbsoluteTime:   1000,
-		include4xx:        false,
-		windowSize:        1000,
-	}
-
+	newClassifier := NewResponseClassifier(connection, 1.5, false, 1000, 1000)
 	rcs.classifiers[connection] = newClassifier
 
 	return newClassifier
@@ -249,13 +318,7 @@ func (rcs *ResponseClassifiers) DispatchWithParams(connection string, maxPercent
 		return classifier // Return the pointer to the value
 	}
 
-	newClassifier := &ResponseClassifier{
-		connectionName:    connection,
-		maxPercentileMult: maxPercentileMult,
-		maxAbsoluteTime:   maxAbsoluteTime,
-		include4xx:        include4xx,
-		windowSize:        windowSize,
-	}
+	newClassifier := NewResponseClassifier(connection, maxPercentileMult, include4xx, windowSize, maxAbsoluteTime)
 
 	rcs.classifiers[connection] = newClassifier
 
@@ -289,6 +352,30 @@ func (rcs ResponseClassifiers) GetClassifierKeys() []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func minSlice(slice []float64) float64 {
+	if len(slice) == 0 {
+		return math.Inf(1) // Return positive infinity if the slice is empty
+	}
+	min := slice[0]
+	for _, value := range slice {
+		if value < min {
+			min = value
+		}
+	}
+	return min
+}
+
+func average(slice []float64) float64 {
+	if len(slice) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, value := range slice {
+		sum += value
+	}
+	return sum / float64(len(slice))
 }
 
 func NewResponse(time int, code int) Response {

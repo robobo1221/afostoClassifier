@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
@@ -261,6 +262,22 @@ func plotScores(scores []float64, name string, title string) {
 	}
 }
 
+func promWrapper(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r)
+
+		// Reset the scores
+		classifierKeys := classifiers.GetClassifierKeys()
+
+		for _, key := range classifierKeys {
+			classifier := classifiers.Get(key)
+
+			fmt.Println("Resetting scores for", key)
+			classifier.ResetPrevScores()
+		}
+	})
+}
+
 func main() {
 	database.InitSqlite()
 	database.Migrate()
@@ -270,8 +287,9 @@ func main() {
 	})
 
 	http.HandleFunc("/graph", graphDatas)
-
 	http.HandleFunc("/send", sendRequest)
+
+	http.Handle("/metrics", promWrapper(promhttp.Handler()))
 
 	port := os.Getenv("PORT")
 	if port == "" {
