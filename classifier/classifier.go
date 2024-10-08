@@ -1,15 +1,15 @@
 package resposnseclassifier
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net/http"
-	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"robin.stik/server/database"
 	psqr "robin.stik/server/psqr"
-
-	database "robin.stik/server/database"
 )
 
 type Response struct {
@@ -18,97 +18,71 @@ type Response struct {
 }
 
 type ResponseClassifier struct {
-	connectionName       string
-	maxPercentileMult    float32
-	maxAbsoluteTime      int
-	include4xx           bool
-	currentResponse      Response
-	currentScore         float64
-	windowSize           int
-	previousScores       []float64 // To store previous 5 scores
-	previousMetricScores []float64
-	CurrentPromMetrics   PromMetrics
+	connectionName    string
+	maxPercentileMult float32
+	maxAbsoluteTime   int
+	include4xx        bool
+	currentResponse   Response
+	currentScore      float64
+	windowSize        int
+	previousScores    []float64 // To store previous 5 scores
 }
 
 type ResponseClassifiers struct {
-	classifiers map[string]*ResponseClassifier // map of connectionName to ResponseClassifier
+	classifiers        map[string]*ResponseClassifier // map of connectionName to ResponseClassifier
+	CurrentOtelMetrics *OtelMetrics
 }
 
-type classifyMiddleware struct {
+type ClassifyMiddleware struct {
 	handler    http.HandlerFunc
 	classifier *ResponseClassifier
 }
 
-type PromMetrics struct {
-	// prometheus metrics
-	ResponseTime prometheus.Counter
-	ResponseCode prometheus.Histogram
-	Score        prometheus.Gauge
+type OtelMetrics struct {
+	ResponseTime metric.Float64Histogram
+	Score        metric.Float64Histogram
 }
 
-func sanitizeMetricName(name string) string {
-	// Replace '/' with '_'
-	sanitized := strings.ReplaceAll(name, "/", "_")
-	// Add more replacements if necessary
-	return sanitized
-}
-
-func NewPromMetrics(connectionName string) *PromMetrics {
-	sanitizedName := sanitizeMetricName(connectionName)
-
-	metrics := &PromMetrics{
-		ResponseTime: prometheus.NewCounter(
-			prometheus.CounterOpts{
-				Name: fmt.Sprintf("response_time_%s", sanitizedName),
-				Help: "Response time of the request",
-			},
-		),
-		ResponseCode: prometheus.NewHistogram(
-			prometheus.HistogramOpts{
-				Name:    fmt.Sprintf("response_code_%s", sanitizedName),
-				Help:    "Response code of the request",
-				Buckets: []float64{200, 300, 400, 500, 600},
-			},
-		),
-		Score: prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: fmt.Sprintf("score_%s", sanitizedName),
-				Help: "Score of the request",
-			},
-		),
+func NewOtelMetrics(meter metric.Meter) *OtelMetrics {
+	responseTime, err := meter.Float64Histogram(
+		"http_response_time",
+		metric.WithDescription("Response time of the request in milliseconds"),
+	)
+	if err != nil {
+		fmt.Printf("Error creating ResponseTime histogram: %v\n", err)
 	}
 
-	fmt.Printf("Registered PromMetrics for %s: %+v\n", sanitizedName, metrics)
-
-	// Register the metrics with Prometheus
-	if err := prometheus.Register(metrics.ResponseTime); err != nil {
-		fmt.Printf("Error registering ResponseTime metric: %v\n", err)
-	}
-	if err := prometheus.Register(metrics.ResponseCode); err != nil {
-		fmt.Printf("Error registering ResponseCode metric: %v\n", err)
-	}
-	if err := prometheus.Register(metrics.Score); err != nil {
-		fmt.Printf("Error registering Score metric: %v\n", err)
+	score, err := meter.Float64Histogram(
+		"http_request_score",
+		metric.WithDescription("Score of the request"),
+		metric.WithExplicitBucketBoundaries(0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+	)
+	if err != nil {
+		fmt.Printf("Error creating Score histogram: %v\n", err)
 	}
 
-	return metrics
+	fmt.Println("Registered OpenTelemetry Metrics.")
+
+	return &OtelMetrics{
+		ResponseTime: responseTime,
+		Score:        score,
+	}
 }
 
 func NewResponseClassifier(connectionName string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int) *ResponseClassifier {
 	return &ResponseClassifier{
-		connectionName:     connectionName,
-		maxPercentileMult:  maxPercentileMult,
-		maxAbsoluteTime:    maxAbsoluteTime,
-		include4xx:         include4xx,
-		currentResponse:    Response{time: 0, code: 0},
-		currentScore:       1.0,
-		windowSize:         windowSize,
-		previousScores:     make([]float64, 0, 5), // Initialize slice for previous scores
-		CurrentPromMetrics: *NewPromMetrics(connectionName),
+		connectionName:    connectionName,
+		maxPercentileMult: maxPercentileMult,
+		maxAbsoluteTime:   maxAbsoluteTime,
+		include4xx:        include4xx,
+		currentResponse:   Response{time: 0, code: 0},
+		currentScore:      1.0,
+		windowSize:        windowSize,
+		previousScores:    make([]float64, 0, 5), // Initialize slice for previous scores
 	}
 }
 
-// Smooths the current score based on the gaussian curve of the last 10 scores
+// Smooths the current score based on the gaussian curve of the last 5 scores
 func (rc *ResponseClassifier) applyLowPassFilter(newScore float64) float64 {
 	// gaussian weights
 	weights := []float64{0.1, 0.15, 0.2, 0.15, 0.1}
@@ -116,7 +90,7 @@ func (rc *ResponseClassifier) applyLowPassFilter(newScore float64) float64 {
 	// Add the new score to the previous scores
 	rc.previousScores = append(rc.previousScores, newScore)
 
-	// If the length of the previous scores is greater than 10, remove the first element
+	// If the length of the previous scores is greater than 5, remove the first element
 	if len(rc.previousScores) > 5 {
 		rc.previousScores = rc.previousScores[1:]
 	}
@@ -128,7 +102,6 @@ func (rc *ResponseClassifier) applyLowPassFilter(newScore float64) float64 {
 	// Apply the gaussian weights to the previous scores
 	for i, score := range rc.previousScores {
 		smoothedScore += score * weights[i]
-
 		totalWeight += weights[i]
 	}
 
@@ -138,132 +111,123 @@ func (rc *ResponseClassifier) applyLowPassFilter(newScore float64) float64 {
 func (rc *ResponseClassifier) getPreviousPsqr(id int) *psqr.Psqr {
 	_, _, foundPerc, count, q, n, np, dn := database.GetPsqr(id)
 
-	psqr := psqr.NewPsqr(foundPerc)
+	psqrObj := psqr.NewPsqr(foundPerc)
 
 	if foundPerc == 0 {
-		return psqr
+		return psqrObj
 	}
 
-	psqr.Count = count
-	psqr.Q = q
-	psqr.N = n
-	psqr.Np = np
-	psqr.Dn = dn
+	psqrObj.Count = count
+	psqrObj.Q = q
+	psqrObj.N = n
+	psqrObj.Np = np
+	psqrObj.Dn = dn
 
-	return psqr
+	return psqrObj
 }
 
 func (rc *ResponseClassifier) getPsqr(perc float64) (int, any, *psqr.Psqr) {
 	id, previousPsqrId, foundPerc, count, q, n, np, dn := database.GetPsqrFromConnection(rc.connectionName, perc)
 
-	psqr := psqr.NewPsqr(perc)
+	psqrObj := psqr.NewPsqr(perc)
 
 	if foundPerc == 0 {
-		return -1, nil, psqr
+		return -1, nil, psqrObj
 	}
 
-	psqr.Count = count
-	psqr.Q = q
-	psqr.N = n
-	psqr.Np = np
-	psqr.Dn = dn
+	psqrObj.Count = count
+	psqrObj.Q = q
+	psqrObj.N = n
+	psqrObj.Np = np
+	psqrObj.Dn = dn
 
-	return id, previousPsqrId, psqr
+	return id, previousPsqrId, psqrObj
 }
 
 func (rc *ResponseClassifier) Classify() float64 {
-	defer rc.RecordMetrics()
-
 	// classify response
 	response := &rc.currentResponse
-	if response.code >= 400 && rc.include4xx || response.code >= 500 {
-		newScore := -2.0
+	if (response.code >= 400 && rc.include4xx) || response.code >= 500 {
+		newScore := 0.0
 		rc.currentScore = newScore
-
 		return rc.currentScore
 	}
 
-	precentile := 0.95
+	percentile := 0.95
 
-	_, previousId, psqr := rc.getPsqr(precentile)
+	_, previousId, psqrObj := rc.getPsqr(percentile)
 
-	if (psqr.Count+1)%rc.windowSize == 0 {
-		database.SwapPsqr(rc.connectionName, precentile)
-
-		// get new psqr and reset
-		_, _, psqr = rc.getPsqr(precentile)
-		psqr.Reset()
-	}
-
-	psqr.Add(float64(response.time))
-	// update the psqr values in the database
-	rc.RegisterData(psqr)
-
-	p90 := psqr.Get()
+	p90 := psqrObj.Get()
 	score := 1.0
 
 	if previousId != nil {
 		prevId := int(previousId.(int64))
 		previousPsqr := rc.getPreviousPsqr(prevId)
 		prevP90 := previousPsqr.Get()
-		n := psqr.Count
+		n := psqrObj.Count
 		w2 := float64(n%rc.windowSize+1) / float64(rc.windowSize)
 		w1 := 1.0 - w2
 		p90 = w1*prevP90 + w2*p90
 	}
 
-	if previousId != nil || psqr.Count > 5 {
+	if previousId != nil || psqrObj.Count > 5 {
 		upperLimit := math.Min(float64(rc.maxPercentileMult)*p90, float64(rc.maxAbsoluteTime))
-		score = (upperLimit - float64(response.time)) / upperLimit
+		score = (upperLimit-float64(response.time))/math.Max(upperLimit, float64(response.time))*0.5 + 0.5 // Score between 0 and 1
 	}
 
 	// Apply the low-pass filter to smooth the score
 	smoothedScore := rc.applyLowPassFilter(score)
-
 	rc.currentScore = smoothedScore
+
+	n := psqrObj.Count + 1
+
+	if n%rc.windowSize == 0 {
+		database.SwapPsqr(rc.connectionName, percentile)
+
+		// reset the psqr values
+		psqrObj.Reset()
+	}
+
+	psqrObj.Add(float64(response.time))
+	// update the psqr values in the database
+	rc.RegisterData(psqrObj)
 
 	return rc.currentScore
 }
 
-func (rc *ResponseClassifier) ResetPrevScores() {
-	rc.previousMetricScores = []float64{}
+func (rcs *ResponseClassifiers) RecordMetrics(ctx context.Context, rc *ResponseClassifier) {
+	attrs := []attribute.KeyValue{
+		attribute.String("connection_name", rc.connectionName),
+	}
+
+	// Record metrics using OpenTelemetry instruments
+	rcs.CurrentOtelMetrics.ResponseTime.Record(ctx, float64(rc.currentResponse.time), metric.WithAttributes(attrs...))
+	rcs.CurrentOtelMetrics.Score.Record(ctx, rc.currentScore, metric.WithAttributes(attrs...))
 }
 
-func (rc *ResponseClassifier) RecordMetrics() {
-	rc.previousMetricScores = append(rc.previousMetricScores, rc.currentScore)
-
-	// Record the metrics to Prometheus
-
-	// Update Prometheus metrics
-	rc.CurrentPromMetrics.ResponseTime.Add(float64(rc.currentResponse.time))
-	rc.CurrentPromMetrics.ResponseCode.Observe(float64(rc.currentResponse.code))
-
-	rc.CurrentPromMetrics.Score.Set(average(rc.previousMetricScores))
-}
-
-func (rc *ResponseClassifier) registerPreviousData(id int, psqr *psqr.Psqr) {
+func (rc *ResponseClassifier) registerPreviousData(id int, psqrObj *psqr.Psqr) {
 	// Register previous data in database
 	database.UpdatePsqr(
 		id,
-		psqr.Perc,
-		psqr.Count,
-		psqr.Q[0], psqr.Q[1], psqr.Q[2], psqr.Q[3], psqr.Q[4],
-		psqr.N[0], psqr.N[1], psqr.N[2], psqr.N[3], psqr.N[4],
-		psqr.Np[0], psqr.Np[1], psqr.Np[2], psqr.Np[3], psqr.Np[4],
-		psqr.Dn[0], psqr.Dn[1], psqr.Dn[2], psqr.Dn[3], psqr.Dn[4],
+		psqrObj.Perc,
+		psqrObj.Count,
+		psqrObj.Q[0], psqrObj.Q[1], psqrObj.Q[2], psqrObj.Q[3], psqrObj.Q[4],
+		psqrObj.N[0], psqrObj.N[1], psqrObj.N[2], psqrObj.N[3], psqrObj.N[4],
+		psqrObj.Np[0], psqrObj.Np[1], psqrObj.Np[2], psqrObj.Np[3], psqrObj.Np[4],
+		psqrObj.Dn[0], psqrObj.Dn[1], psqrObj.Dn[2], psqrObj.Dn[3], psqrObj.Dn[4],
 	)
 }
 
-func (rc *ResponseClassifier) RegisterData(psqr *psqr.Psqr) {
+func (rc *ResponseClassifier) RegisterData(psqrObj *psqr.Psqr) {
 	// register data in database
 	database.InsertConnectionWithPsqr(
 		rc.connectionName,
-		psqr.Perc,
-		psqr.Count,
-		psqr.Q[0], psqr.Q[1], psqr.Q[2], psqr.Q[3], psqr.Q[4],
-		psqr.N[0], psqr.N[1], psqr.N[2], psqr.N[3], psqr.N[4],
-		psqr.Np[0], psqr.Np[1], psqr.Np[2], psqr.Np[3], psqr.Np[4],
-		psqr.Dn[0], psqr.Dn[1], psqr.Dn[2], psqr.Dn[3], psqr.Dn[4],
+		psqrObj.Perc,
+		psqrObj.Count,
+		psqrObj.Q[0], psqrObj.Q[1], psqrObj.Q[2], psqrObj.Q[3], psqrObj.Q[4],
+		psqrObj.N[0], psqrObj.N[1], psqrObj.N[2], psqrObj.N[3], psqrObj.N[4],
+		psqrObj.Np[0], psqrObj.Np[1], psqrObj.Np[2], psqrObj.Np[3], psqrObj.Np[4],
+		psqrObj.Dn[0], psqrObj.Dn[1], psqrObj.Dn[2], psqrObj.Dn[3], psqrObj.Dn[4],
 	)
 }
 
@@ -287,17 +251,19 @@ func (rc *ResponseClassifier) GetWindowSize() int {
 	return rc.windowSize
 }
 
-func NewResponseClassifiers() ResponseClassifiers {
-	return ResponseClassifiers{
-		classifiers: make(map[string]*ResponseClassifier),
+func NewResponseClassifiers(meter metric.Meter) *ResponseClassifiers {
+	return &ResponseClassifiers{
+		classifiers:        make(map[string]*ResponseClassifier),
+		CurrentOtelMetrics: NewOtelMetrics(meter),
 	}
 }
 
-func NewResponseClassifiersWithClassifiers(connections []string) {
-	rcs := NewResponseClassifiers()
+func NewResponseClassifiersWithClassifiers(connections []string, meter metric.Meter) *ResponseClassifiers {
+	rcs := NewResponseClassifiers(meter)
 	for _, connection := range connections {
 		rcs.Dispatch(connection)
 	}
+	return rcs
 }
 
 func (rcs *ResponseClassifiers) Dispatch(connection string) *ResponseClassifier {
@@ -319,6 +285,25 @@ func (rcs *ResponseClassifiers) DispatchWithParams(connection string, maxPercent
 	}
 
 	newClassifier := NewResponseClassifier(connection, maxPercentileMult, include4xx, windowSize, maxAbsoluteTime)
+
+	rcs.classifiers[connection] = newClassifier
+
+	return newClassifier
+}
+
+func (rcs *ResponseClassifiers) DispatchWithParamsAndClassify(ctx context.Context, connection string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int, respTime int, code int) *ResponseClassifier {
+	// Check if connection already exists
+	if classifier, ok := rcs.classifiers[connection]; ok {
+		classifier.SetResponse(respTime, code)
+		classifier.Classify()
+		rcs.RecordMetrics(ctx, classifier)
+		return classifier // Return the pointer to the value
+	}
+
+	newClassifier := NewResponseClassifier(connection, maxPercentileMult, include4xx, windowSize, maxAbsoluteTime)
+	newClassifier.SetResponse(respTime, code)
+	newClassifier.Classify()
+	rcs.RecordMetrics(ctx, newClassifier)
 
 	rcs.classifiers[connection] = newClassifier
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"image/color"
 	"math"
@@ -10,16 +11,19 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/sdk/metric"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
 	classifier "robin.stik/server/classifier"
-	database "robin.stik/server/database"
+	"robin.stik/server/database"
 	psqr "robin.stik/server/psqr"
 )
 
 var (
-	classifiers = classifier.NewResponseClassifiers()
+	// Removed global classifiers variable
+	// Initialize it inside main after Meter is available
 
 	// This is to plot the data
 	data                       = []float64{}
@@ -37,10 +41,15 @@ func calculatePercentile(data []float64, percentile float64) float64 {
 	sort.Float64s(sortedData)
 
 	n := len(sortedData)
-	index := int(math.Ceil(float64(n) * percentile))
-
-	if index == n {
-		return sortedData[n-1]
+	if n == 0 {
+		return 0
+	}
+	index := int(math.Ceil(float64(n)*percentile)) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= n {
+		index = n - 1
 	}
 
 	return sortedData[index]
@@ -85,8 +94,8 @@ func handleData(w http.ResponseWriter, classifier *classifier.ResponseClassifier
 	scores = append(scores, classifier.GetScore())
 
 	fmt.Fprintln(w, "Status:", resp.StatusCode)
-	fmt.Fprintln(w, "Resposnse Time:", respTime)
-	fmt.Fprintln(w, "classifier:", classifier.GetConnectionName())
+	fmt.Fprintln(w, "Response Time:", respTime)
+	fmt.Fprintln(w, "Classifier:", classifier.GetConnectionName())
 	fmt.Fprintln(w, "Score:", classifier.GetScore())
 	fmt.Fprintln(w, "Perc:", perc)
 	fmt.Fprintln(w, "Count:", count)
@@ -96,24 +105,47 @@ func handleData(w http.ResponseWriter, classifier *classifier.ResponseClassifier
 	fmt.Fprintln(w, "Dn:", dn)
 }
 
-func sendRequest(w http.ResponseWriter, r *http.Request) {
+func doRequest(uri string, connectionName string, w http.ResponseWriter, r *http.Request, classifiers *classifier.ResponseClassifiers, ctx context.Context) {
 	timeStart := time.Now()
-	resp, err := http.Get("https://bol.com/")
+	resp, err := http.Get(uri)
 
 	respTime := time.Since(timeStart).Milliseconds()
 
 	if err != nil {
 		fmt.Println("Error:", err)
 		fmt.Println("Response Time:", respTime)
+		return
 	}
 	defer resp.Body.Close()
 
-	classifier := classifiers.DispatchWithParams("bol/index", 1.5, true, 1000, 1000)
+	classifiers.DispatchWithParamsAndClassify(
+		ctx,
+		connectionName,
+		1.0,
+		true,
+		500,
+		1000,
+		int(respTime),
+		resp.StatusCode,
+	)
+}
 
-	classifier.SetResponse(int(respTime), resp.StatusCode)
-	classifier.Classify()
+func sendRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, classifiers *classifier.ResponseClassifiers) {
+	go func() {
+		for i := 0; i < 1e10; i++ {
+			go doRequest("https://afosto.com", "afosto/index", w, r, classifiers, ctx)
+			go doRequest("https://www.bol.com/nl/nl/", "bol/index", w, r, classifiers, ctx)
+			go doRequest("https://www.google.com/", "google/index", w, r, classifiers, ctx)
+			go doRequest("https://www.hanze.nl/nl", "hanze/index", w, r, classifiers, ctx)
+			go doRequest("https://www.shopify.com/", "shopify/index", w, r, classifiers, ctx)
 
-	handleData(w, classifier, resp, respTime)
+			fmt.Println("Request", i)
+
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
+	doRequest("https://afosto.com", "afosto/index", w, r, classifiers, ctx)
 }
 
 func graphDatas(w http.ResponseWriter, r *http.Request) {
@@ -133,21 +165,21 @@ func plotErrorRates(errorRates []float64, name string, title string) {
 	p.Y.Max = 1.0
 	p.Y.Min = 0.0
 
-	var currentSegment plotter.XYs
-
+	pts := make(plotter.XYs, len(errorRates))
 	for i, errorRate := range errorRates {
-		currentSegment = append(currentSegment, plotter.XY{X: float64(i), Y: errorRate})
+		pts[i].X = float64(i)
+		pts[i].Y = errorRate
 	}
 
-	// Create a scatter plot
-	scatter, err := plotter.NewLine(currentSegment)
+	// Create a line plot
+	line, err := plotter.NewLine(pts)
 	if err != nil {
 		panic(err)
 	}
-	p.Add(scatter)
+	p.Add(line)
 
 	// Save the plot to a PNG file
-	if err := p.Save(6*3*vg.Inch, 4*3*vg.Inch, "./images/"+name); err != nil {
+	if err := p.Save(6*vg.Inch, 4*vg.Inch, "./images/"+name); err != nil {
 		panic(err)
 	}
 }
@@ -159,42 +191,63 @@ func plotActualvsApproximated(actualValues []float64, approximated []float64, na
 	p.X.Label.Text = "Observation #"
 	p.Y.Label.Text = "Value"
 
-	// scale the y-axis to the actual values
-	p.Y.Max = 1000.0
-	p.Y.Min = 0.0
-
-	var actualSegment plotter.XYs
-
-	for i, actualValue := range actualValues {
-		actualSegment = append(actualSegment, plotter.XY{X: float64(i), Y: actualValue})
+	// Determine Y-axis range
+	var maxY, minY float64
+	if len(actualValues) > 0 {
+		maxY = actualValues[0]
+		minY = actualValues[0]
+		for _, v := range actualValues {
+			if v > maxY {
+				maxY = v
+			}
+			if v < minY {
+				minY = v
+			}
+		}
 	}
+	if len(approximated) > 0 {
+		for _, v := range approximated {
+			if v > maxY {
+				maxY = v
+			}
+			if v < minY {
+				minY = v
+			}
+		}
+	}
+	p.Y.Max = maxY * 1.1
+	p.Y.Min = minY * 0.9
 
-	// Create a scatter plot
-	scatterActual, err := plotter.NewLine(actualSegment)
+	// Actual values line
+	actualPts := make(plotter.XYs, len(actualValues))
+	for i, val := range actualValues {
+		actualPts[i].X = float64(i)
+		actualPts[i].Y = val
+	}
+	actualLine, err := plotter.NewLine(actualPts)
 	if err != nil {
 		panic(err)
 	}
-	scatterActual.Color = color.RGBA{R: 0, G: 0, B: 255, A: 255}
-	p.Add(scatterActual)
+	actualLine.Color = color.RGBA{R: 0, G: 0, B: 255, A: 255} // Blue
+	p.Add(actualLine)
+	p.Legend.Add("Actual", actualLine)
 
-	// plot the approximated values
-	var approximatedSegment plotter.XYs
-
-	for i, approximatedValue := range approximated {
-		approximatedSegment = append(approximatedSegment, plotter.XY{X: float64(i), Y: approximatedValue})
+	// Approximated values line
+	approxPts := make(plotter.XYs, len(approximated))
+	for i, val := range approximated {
+		approxPts[i].X = float64(i)
+		approxPts[i].Y = val
 	}
-
-	// Create a scatter plot
-	scatterApproximated, err := plotter.NewLine(approximatedSegment)
+	approxLine, err := plotter.NewLine(approxPts)
 	if err != nil {
 		panic(err)
 	}
-
-	scatterApproximated.Color = color.RGBA{R: 255, G: 0, B: 0, A: 255}
-	p.Add(scatterApproximated)
+	approxLine.Color = color.RGBA{R: 255, G: 0, B: 0, A: 255} // Red
+	p.Add(approxLine)
+	p.Legend.Add("Approximated", approxLine)
 
 	// Save the plot to a PNG file
-	if err := p.Save(6*3*vg.Inch, 4*3*vg.Inch, "./images/"+name); err != nil {
+	if err := p.Save(6*vg.Inch, 4*vg.Inch, "./images/"+name); err != nil {
 		panic(err)
 	}
 }
@@ -257,39 +310,49 @@ func plotScores(scores []float64, name string, title string) {
 	}
 
 	// Save the plot to a PNG file
-	if err := p.Save(6*3*vg.Inch, 4*3*vg.Inch, "./images/"+name); err != nil {
+	if err := p.Save(6*vg.Inch, 4*vg.Inch, "./images/"+name); err != nil {
 		panic(err)
 	}
 }
 
-func promWrapper(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.ServeHTTP(w, r)
+func serveMetrics(exporter *prometheus.Exporter) {
+	http.Handle("/metrics", promhttp.Handler())
 
-		// Reset the scores
-		classifierKeys := classifiers.GetClassifierKeys()
-
-		for _, key := range classifierKeys {
-			classifier := classifiers.Get(key)
-
-			fmt.Println("Resetting scores for", key)
-			classifier.ResetPrevScores()
-		}
-	})
+	fmt.Println("Metrics server started on :8081")
+	if err := http.ListenAndServe(":8081", nil); err != nil {
+		fmt.Println("Error starting metrics server:", err)
+	}
 }
 
 func main() {
+	ctx := context.Background()
+
+	// Initialize OpenTelemetry Prometheus Exporter
+	exporter, err := prometheus.New()
+	if err != nil {
+		fmt.Println("Error initializing Prometheus exporter:", err)
+		return
+	}
+
+	// Create a MeterProvider with the exporter
+	provider := metric.NewMeterProvider(metric.WithReader(exporter))
+	meter := provider.Meter("robin.stik/server")
+
+	// Initialize ResponseClassifiers with the Meter
+	classifiers := classifier.NewResponseClassifiers(meter)
+
+	// Start the metrics server using the exporter’s handler
+	go serveMetrics(exporter)
+
+	// Initialize database
 	database.InitSqlite()
 	database.Migrate()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Hello, World!")
-	})
-
+	// Set up HTTP handlers
 	http.HandleFunc("/graph", graphDatas)
-	http.HandleFunc("/send", sendRequest)
-
-	http.Handle("/metrics", promWrapper(promhttp.Handler()))
+	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+		sendRequest(ctx, w, r, classifiers)
+	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -297,5 +360,7 @@ func main() {
 	}
 
 	fmt.Printf("Server is running on port %s\n", port)
-	http.ListenAndServe(":"+port, nil)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		fmt.Println("Error starting server:", err)
+	}
 }
