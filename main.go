@@ -10,22 +10,25 @@ import (
 	"sort"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
 	classifier "robin.stik/server/classifier"
 	"robin.stik/server/database"
 	psqr "robin.stik/server/psqr"
+
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 )
 
 var (
-	// Removed global classifiers variable
-	// Initialize it inside main after Meter is available
-
-	// This is to plot the data
+	// Data for plotting
 	data                       = []float64{}
 	dataReal                   = []float64{}
 	errorRates                 = []float64{}
@@ -35,117 +38,124 @@ var (
 	previousPercentile float64 = -1.
 )
 
-func calculatePercentile(data []float64, percentile float64) float64 {
-	sortedData := make([]float64, len(data))
-	copy(sortedData, data)
-	sort.Float64s(sortedData)
-
-	n := len(sortedData)
-	if n == 0 {
-		return 0
-	}
-	index := int(math.Ceil(float64(n)*percentile)) - 1
-	if index < 0 {
-		index = 0
-	}
-	if index >= n {
-		index = n - 1
-	}
-
-	return sortedData[index]
-}
-
-func handleData(w http.ResponseWriter, classifier *classifier.ResponseClassifier, resp *http.Response, respTime int64) {
-	_, _, perc, count, q, n, np, dn := database.GetPsqrFromConnection(classifier.GetConnectionName(), 0.95)
-
-	latestResponse := classifier.GetResponse()
-	latestResponseCode := latestResponse.GetCode()
-
-	if !(latestResponseCode > 400) {
-		nRequest++
-		if nRequest%classifier.GetWindowSize() == 0 {
-			previousPercentile = calculatePercentile(responses, 0.95)
-			responses = []float64{} // reset the responses to simulate a new window
-		}
-
-		responses = append(responses, float64(respTime))
-	}
-
-	realPerc := calculatePercentile(responses, 0.95)
-
-	if previousPercentile != -1 {
-		w2 := float64(nRequest%classifier.GetWindowSize()+1) / float64(classifier.GetWindowSize())
-		w1 := 1.0 - w2
-
-		realPerc = w2*realPerc + w1*previousPercentile
-	}
-
-	newPsqr := psqr.NewPsqr(0.95)
-	newPsqr.Count = count
-	newPsqr.Q = q
-	newPsqr.N = n
-	newPsqr.Np = np
-	newPsqr.Dn = dn
-
-	data = append(data, newPsqr.Get())
-	dataReal = append(dataReal, realPerc)
-
-	errorRates = append(errorRates, math.Abs(realPerc-newPsqr.Get()))
-	scores = append(scores, classifier.GetScore())
-
-	fmt.Fprintln(w, "Status:", resp.StatusCode)
-	fmt.Fprintln(w, "Response Time:", respTime)
-	fmt.Fprintln(w, "Classifier:", classifier.GetConnectionName())
-	fmt.Fprintln(w, "Score:", classifier.GetScore())
-	fmt.Fprintln(w, "Perc:", perc)
-	fmt.Fprintln(w, "Count:", count)
-	fmt.Fprintln(w, "Q:", q)
-	fmt.Fprintln(w, "N:", n)
-	fmt.Fprintln(w, "Np:", np)
-	fmt.Fprintln(w, "Dn:", dn)
-}
-
 func doRequest(uri string, connectionName string, w http.ResponseWriter, r *http.Request, classifiers *classifier.ResponseClassifiers, ctx context.Context) {
+	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	ctx, span := tracer.Start(ctx, "HTTP GET "+uri)
+	defer span.End()
+
 	timeStart := time.Now()
 	resp, err := http.Get(uri)
 
 	respTime := time.Since(timeStart).Milliseconds()
 
 	if err != nil {
-		fmt.Println("Error:", err)
-		fmt.Println("Response Time:", respTime)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	classifiers.DispatchWithParamsAndClassify(
+	span.SetStatus(codes.Ok, "Request successful")
+
+	go classifiers.DispatchWithParamsAndClassify(
 		ctx,
 		connectionName,
 		1.0,
 		true,
-		500,
 		1000,
+		-1,
 		int(respTime),
 		resp.StatusCode,
 	)
+
+	// Name, integrationId,
 }
 
-func sendRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, classifiers *classifier.ResponseClassifiers) {
+func sendRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	go func() {
-		for i := 0; i < 1e10; i++ {
-			go doRequest("https://afosto.com", "afosto/index", w, r, classifiers, ctx)
-			go doRequest("https://www.bol.com/nl/nl/", "bol/index", w, r, classifiers, ctx)
-			go doRequest("https://www.google.com/", "google/index", w, r, classifiers, ctx)
-			go doRequest("https://www.hanze.nl/nl", "hanze/index", w, r, classifiers, ctx)
-			go doRequest("https://www.shopify.com/", "shopify/index", w, r, classifiers, ctx)
+		for i := 0; i >= 0; i++ {
+			go doRequest("https://afosto.com", "afosto/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.bol.com/nl/nl", "bol/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.google.com/", "google/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.hanze.nl/nl", "hanze/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.shopify.com/", "shopify/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.x.com/", "twitter/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.glslsandbox.com/", "glslsandbox/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.shadertoy.com/", "shadertoy/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://www.startpagina.nl/", "startpagina/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+			go doRequest("https://paradox.network/", "paradox/index", w, r, classifier.ResponseClassifiersInstance, ctx)
 
 			fmt.Println("Request", i)
 
-			time.Sleep(1 * time.Second)
+			//time.Sleep((time.Duration(random.Int32N(950)) + 50) * time.Millisecond)
+			time.Sleep(1000 * time.Millisecond)
 		}
 	}()
+}
 
-	doRequest("https://afosto.com", "afosto/index", w, r, classifiers, ctx)
+func setupCollector(ctx context.Context) (*sdktrace.TracerProvider, *metric.MeterProvider, error) {
+	const endpoint = "localhost:4317"
+
+	traceExp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(endpoint), otlptracegrpc.WithInsecure())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	metricExp, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithEndpoint(endpoint), otlpmetricgrpc.WithInsecure())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(traceExp),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("testing-service"),
+		)),
+	)
+
+	mp := metric.NewMeterProvider(
+		metric.WithReader(metric.NewPeriodicReader(metricExp, metric.WithInterval(15*time.Second))),
+		metric.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("testing-service"),
+		)),
+	)
+
+	return tp, mp, nil
+}
+
+func main() {
+	ctx := context.Background()
+	tp, mp, err := setupCollector(ctx)
+	if err != nil {
+		fmt.Println("Error setting up collector:", err)
+		return
+	}
+
+	// Set the global TracerProvider and MeterProvider
+	otel.SetTracerProvider(tp)
+	otel.SetMeterProvider(mp)
+
+	// Initialize database
+	database.InitSqlite()
+	database.Migrate()
+
+	// Set up HTTP handlers
+	http.HandleFunc("/graph", graphDatas)
+	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+		sendRequest(ctx, w, r)
+	})
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("Server is running on port %s\n", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		fmt.Println("Error starting server:", err)
+	}
 }
 
 func graphDatas(w http.ResponseWriter, r *http.Request) {
@@ -315,52 +325,72 @@ func plotScores(scores []float64, name string, title string) {
 	}
 }
 
-func serveMetrics(exporter *prometheus.Exporter) {
-	http.Handle("/metrics", promhttp.Handler())
+func calculatePercentile(data []float64, percentile float64) float64 {
+	sortedData := make([]float64, len(data))
+	copy(sortedData, data)
+	sort.Float64s(sortedData)
 
-	fmt.Println("Metrics server started on :8081")
-	if err := http.ListenAndServe(":8081", nil); err != nil {
-		fmt.Println("Error starting metrics server:", err)
+	n := len(sortedData)
+	if n == 0 {
+		return 0
 	}
+	index := int(math.Ceil(float64(n)*percentile)) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= n {
+		index = n - 1
+	}
+
+	return sortedData[index]
 }
 
-func main() {
-	ctx := context.Background()
+func handleData(w http.ResponseWriter, classifier *classifier.ResponseClassifier, resp *http.Response, respTime int64) {
+	_, _, perc, count, q, n, np, dn := database.GetPsqrFromConnection(classifier.GetConnectionName(), 0.95)
 
-	// Initialize OpenTelemetry Prometheus Exporter
-	exporter, err := prometheus.New()
-	if err != nil {
-		fmt.Println("Error initializing Prometheus exporter:", err)
-		return
+	latestResponse := classifier.GetResponse()
+	latestResponseCode := latestResponse.GetCode()
+
+	if !(latestResponseCode > 400) {
+		nRequest++
+		if nRequest%classifier.GetWindowSize() == 0 {
+			previousPercentile = calculatePercentile(responses, 0.95)
+			responses = []float64{} // Reset the responses to simulate a new window
+		}
+
+		responses = append(responses, float64(respTime))
 	}
 
-	// Create a MeterProvider with the exporter
-	provider := metric.NewMeterProvider(metric.WithReader(exporter))
-	meter := provider.Meter("robin.stik/server")
+	realPerc := calculatePercentile(responses, 0.95)
 
-	// Initialize ResponseClassifiers with the Meter
-	classifiers := classifier.NewResponseClassifiers(meter)
+	if previousPercentile != -1 {
+		w2 := float64(nRequest%classifier.GetWindowSize()+1) / float64(classifier.GetWindowSize())
+		w1 := 1.0 - w2
 
-	// Start the metrics server using the exporter’s handler
-	go serveMetrics(exporter)
-
-	// Initialize database
-	database.InitSqlite()
-	database.Migrate()
-
-	// Set up HTTP handlers
-	http.HandleFunc("/graph", graphDatas)
-	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
-		sendRequest(ctx, w, r, classifiers)
-	})
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+		realPerc = w2*realPerc + w1*previousPercentile
 	}
 
-	fmt.Printf("Server is running on port %s\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		fmt.Println("Error starting server:", err)
-	}
+	newPsqr := psqr.NewPsqr(0.95)
+	newPsqr.Count = count
+	newPsqr.Q = q
+	newPsqr.N = n
+	newPsqr.Np = np
+	newPsqr.Dn = dn
+
+	data = append(data, newPsqr.Get())
+	dataReal = append(dataReal, realPerc)
+
+	errorRates = append(errorRates, math.Abs(realPerc-newPsqr.Get()))
+	scores = append(scores, classifier.GetScore())
+
+	fmt.Fprintln(w, "Status:", resp.StatusCode)
+	fmt.Fprintln(w, "Response Time:", respTime)
+	fmt.Fprintln(w, "Classifier:", classifier.GetConnectionName())
+	fmt.Fprintln(w, "Score:", classifier.GetScore())
+	fmt.Fprintln(w, "Perc:", perc)
+	fmt.Fprintln(w, "Count:", count)
+	fmt.Fprintln(w, "Q:", q)
+	fmt.Fprintln(w, "N:", n)
+	fmt.Fprintln(w, "Np:", np)
+	fmt.Fprintln(w, "Dn:", dn)
 }

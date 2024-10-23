@@ -1,15 +1,23 @@
-package resposnseclassifier
+package classifier
 
 import (
 	"context"
 	"fmt"
 	"math"
-	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"robin.stik/server/database"
 	psqr "robin.stik/server/psqr"
+)
+
+var (
+	ResponseClassifiersInstance *ResponseClassifiers = NewResponseClassifiers()
 )
 
 type Response struct {
@@ -18,6 +26,7 @@ type Response struct {
 }
 
 type ResponseClassifier struct {
+	mu                sync.Mutex
 	connectionName    string
 	maxPercentileMult float32
 	maxAbsoluteTime   int
@@ -25,36 +34,44 @@ type ResponseClassifier struct {
 	currentResponse   Response
 	currentScore      float64
 	windowSize        int
-	previousScores    []float64 // To store previous 5 scores
+	lastFiveScores    []float64
 }
 
 type ResponseClassifiers struct {
-	classifiers        map[string]*ResponseClassifier // map of connectionName to ResponseClassifier
+	classifiers        map[string]*ResponseClassifier // Map of connectionName to ResponseClassifier
 	CurrentOtelMetrics *OtelMetrics
 }
 
-type ClassifyMiddleware struct {
-	handler    http.HandlerFunc
-	classifier *ResponseClassifier
-}
-
 type OtelMetrics struct {
-	ResponseTime metric.Float64Histogram
-	Score        metric.Float64Histogram
+	ResponseTime  metric.Float64Histogram
+	TotalRequests metric.Int64Counter
+	Score         metric.Float64Histogram
 }
 
-func NewOtelMetrics(meter metric.Meter) *OtelMetrics {
+func NewOtelMetrics() *OtelMetrics {
+	meter := otel.GetMeterProvider().Meter("classifier-" + filepath.Base(os.Args[0]))
+
 	responseTime, err := meter.Float64Histogram(
 		"http_response_time",
 		metric.WithDescription("Response time of the request in milliseconds"),
+		metric.WithUnit("ms"),
 	)
 	if err != nil {
 		fmt.Printf("Error creating ResponseTime histogram: %v\n", err)
 	}
 
+	totalRequests, err := meter.Int64Counter(
+		"http_total_requests",
+		metric.WithDescription("Total number of requests"),
+	)
+	if err != nil {
+		fmt.Printf("Error creating TotalRequests counter: %v\n", err)
+	}
+
 	score, err := meter.Float64Histogram(
 		"http_request_score",
 		metric.WithDescription("Score of the request"),
+		metric.WithUnit("score"),
 		metric.WithExplicitBucketBoundaries(0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
 	)
 	if err != nil {
@@ -64,12 +81,17 @@ func NewOtelMetrics(meter metric.Meter) *OtelMetrics {
 	fmt.Println("Registered OpenTelemetry Metrics.")
 
 	return &OtelMetrics{
-		ResponseTime: responseTime,
-		Score:        score,
+		ResponseTime:  responseTime,
+		TotalRequests: totalRequests,
+		Score:         score,
 	}
 }
 
 func NewResponseClassifier(connectionName string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int) *ResponseClassifier {
+	if maxAbsoluteTime < 0 {
+		maxAbsoluteTime = 1e10
+	}
+
 	return &ResponseClassifier{
 		connectionName:    connectionName,
 		maxPercentileMult: maxPercentileMult,
@@ -78,34 +100,8 @@ func NewResponseClassifier(connectionName string, maxPercentileMult float32, inc
 		currentResponse:   Response{time: 0, code: 0},
 		currentScore:      1.0,
 		windowSize:        windowSize,
-		previousScores:    make([]float64, 0, 5), // Initialize slice for previous scores
+		lastFiveScores:    make([]float64, 5),
 	}
-}
-
-// Smooths the current score based on the gaussian curve of the last 5 scores
-func (rc *ResponseClassifier) applyLowPassFilter(newScore float64) float64 {
-	// gaussian weights
-	weights := []float64{0.1, 0.15, 0.2, 0.15, 0.1}
-
-	// Add the new score to the previous scores
-	rc.previousScores = append(rc.previousScores, newScore)
-
-	// If the length of the previous scores is greater than 5, remove the first element
-	if len(rc.previousScores) > 5 {
-		rc.previousScores = rc.previousScores[1:]
-	}
-
-	// Initialize the smoothed score
-	smoothedScore := 0.0
-	totalWeight := 0.0
-
-	// Apply the gaussian weights to the previous scores
-	for i, score := range rc.previousScores {
-		smoothedScore += score * weights[i]
-		totalWeight += weights[i]
-	}
-
-	return smoothedScore / totalWeight
 }
 
 func (rc *ResponseClassifier) getPreviousPsqr(id int) *psqr.Psqr {
@@ -144,12 +140,39 @@ func (rc *ResponseClassifier) getPsqr(perc float64) (int, any, *psqr.Psqr) {
 	return id, previousPsqrId, psqrObj
 }
 
-func (rc *ResponseClassifier) Classify() float64 {
-	// classify response
+func (rc *ResponseClassifier) applyLowPassFilter(score float64) float64 {
+	rc.lastFiveScores = append(rc.lastFiveScores, score)
+	if len(rc.lastFiveScores) > 5 {
+		rc.lastFiveScores = rc.lastFiveScores[1:]
+	}
+
+	// Calculate the average of the last five scores
+	average := 0.0
+	for _, s := range rc.lastFiveScores {
+		average += s
+	}
+	average /= float64(len(rc.lastFiveScores))
+
+	return average
+}
+
+func (rc *ResponseClassifier) Classify(ctx context.Context) float64 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	_, span := otel.GetTracerProvider().Tracer("robin.stik/server").Start(ctx, "Classify")
+	defer span.End()
+
+	// Classify response
 	response := &rc.currentResponse
 	if (response.code >= 400 && rc.include4xx) || response.code >= 500 {
 		newScore := 0.0
 		rc.currentScore = newScore
+
+		// Error
+		span.RecordError(fmt.Errorf("Error response code: %d", response.code))
+		span.SetStatus(codes.Error, fmt.Sprintf("Error response code: %d", response.code))
+
 		return rc.currentScore
 	}
 
@@ -175,33 +198,50 @@ func (rc *ResponseClassifier) Classify() float64 {
 		score = (upperLimit-float64(response.time))/math.Max(upperLimit, float64(response.time))*0.5 + 0.5 // Score between 0 and 1
 	}
 
+	score = rc.applyLowPassFilter(score)
+
+	if score < 0.5 {
+		span.RecordError(fmt.Errorf("Response time too high: %d", response.time))
+		span.SetStatus(codes.Error, fmt.Sprintf("Response time too high: %d", response.time))
+	}
+
 	// Apply the low-pass filter to smooth the score
-	smoothedScore := rc.applyLowPassFilter(score)
-	rc.currentScore = smoothedScore
+	//smoothedScore := rc.applyLowPassFilter(score)
+	rc.currentScore = score
 
 	n := psqrObj.Count + 1
 
 	if n%rc.windowSize == 0 {
 		database.SwapPsqr(rc.connectionName, percentile)
 
-		// reset the psqr values
+		// Reset the psqr values
 		psqrObj.Reset()
 	}
 
-	psqrObj.Add(float64(response.time))
-	// update the psqr values in the database
-	rc.RegisterData(psqrObj)
+	// Ensure the response is successful before adding the response time to the psqr object.
+	if response.code < 400 {
+		psqrObj.Add(float64(response.time))
+		// Update the psqr values in the database
+		rc.RegisterData(psqrObj)
+	}
 
 	return rc.currentScore
 }
 
 func (rcs *ResponseClassifiers) RecordMetrics(ctx context.Context, rc *ResponseClassifier) {
+	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	ctx, span := tracer.Start(ctx, "RecordMetrics")
+	defer span.End()
+
 	attrs := []attribute.KeyValue{
 		attribute.String("connection_name", rc.connectionName),
 	}
 
-	// Record metrics using OpenTelemetry instruments
+	attrsForCount := append(attrs, attribute.String("status_code", fmt.Sprintf("%d", rc.currentResponse.code)))
+
+	// Record metrics
 	rcs.CurrentOtelMetrics.ResponseTime.Record(ctx, float64(rc.currentResponse.time), metric.WithAttributes(attrs...))
+	rcs.CurrentOtelMetrics.TotalRequests.Add(ctx, 60, metric.WithAttributes(attrsForCount...))
 	rcs.CurrentOtelMetrics.Score.Record(ctx, rc.currentScore, metric.WithAttributes(attrs...))
 }
 
@@ -219,7 +259,7 @@ func (rc *ResponseClassifier) registerPreviousData(id int, psqrObj *psqr.Psqr) {
 }
 
 func (rc *ResponseClassifier) RegisterData(psqrObj *psqr.Psqr) {
-	// register data in database
+	// Register data in database
 	database.InsertConnectionWithPsqr(
 		rc.connectionName,
 		psqrObj.Perc,
@@ -236,6 +276,9 @@ func (rc *ResponseClassifier) GetConnectionName() string {
 }
 
 func (rc *ResponseClassifier) SetResponse(time int, code int) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
 	rc.currentResponse = NewResponse(time, code)
 }
 
@@ -251,116 +294,34 @@ func (rc *ResponseClassifier) GetWindowSize() int {
 	return rc.windowSize
 }
 
-func NewResponseClassifiers(meter metric.Meter) *ResponseClassifiers {
+func NewResponseClassifiers() *ResponseClassifiers {
 	return &ResponseClassifiers{
 		classifiers:        make(map[string]*ResponseClassifier),
-		CurrentOtelMetrics: NewOtelMetrics(meter),
+		CurrentOtelMetrics: NewOtelMetrics(),
 	}
-}
-
-func NewResponseClassifiersWithClassifiers(connections []string, meter metric.Meter) *ResponseClassifiers {
-	rcs := NewResponseClassifiers(meter)
-	for _, connection := range connections {
-		rcs.Dispatch(connection)
-	}
-	return rcs
-}
-
-func (rcs *ResponseClassifiers) Dispatch(connection string) *ResponseClassifier {
-	// check if connection already exists
-	if classifier, ok := rcs.classifiers[connection]; ok {
-		return classifier
-	}
-
-	newClassifier := NewResponseClassifier(connection, 1.5, false, 1000, 1000)
-	rcs.classifiers[connection] = newClassifier
-
-	return newClassifier
-}
-
-func (rcs *ResponseClassifiers) DispatchWithParams(connection string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int) *ResponseClassifier {
-	// Check if connection already exists
-	if classifier, ok := rcs.classifiers[connection]; ok {
-		return classifier // Return the pointer to the value
-	}
-
-	newClassifier := NewResponseClassifier(connection, maxPercentileMult, include4xx, windowSize, maxAbsoluteTime)
-
-	rcs.classifiers[connection] = newClassifier
-
-	return newClassifier
 }
 
 func (rcs *ResponseClassifiers) DispatchWithParamsAndClassify(ctx context.Context, connection string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int, respTime int, code int) *ResponseClassifier {
+	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	ctx, span := tracer.Start(ctx, "DispatchWithParamsAndClassify")
+	defer span.End()
+
 	// Check if connection already exists
 	if classifier, ok := rcs.classifiers[connection]; ok {
 		classifier.SetResponse(respTime, code)
-		classifier.Classify()
-		rcs.RecordMetrics(ctx, classifier)
+		classifier.Classify(ctx)
+		go rcs.RecordMetrics(ctx, classifier)
 		return classifier // Return the pointer to the value
 	}
 
 	newClassifier := NewResponseClassifier(connection, maxPercentileMult, include4xx, windowSize, maxAbsoluteTime)
 	newClassifier.SetResponse(respTime, code)
-	newClassifier.Classify()
-	rcs.RecordMetrics(ctx, newClassifier)
+	newClassifier.Classify(ctx)
+	go rcs.RecordMetrics(ctx, newClassifier)
 
 	rcs.classifiers[connection] = newClassifier
 
 	return newClassifier
-}
-
-func (rcs *ResponseClassifiers) DispatchWithClassifier(
-	classifier *ResponseClassifier,
-) *ResponseClassifier {
-	// check if connection already exists
-	if _, ok := rcs.classifiers[classifier.connectionName]; ok {
-		classifier := rcs.classifiers[classifier.connectionName]
-		return classifier
-	}
-
-	rcs.classifiers[classifier.connectionName] = classifier
-
-	return classifier
-}
-
-func (rcs *ResponseClassifiers) Get(connection string) *ResponseClassifier {
-	if classifier, ok := rcs.classifiers[connection]; ok {
-		return classifier
-	}
-	return nil
-}
-
-func (rcs ResponseClassifiers) GetClassifierKeys() []string {
-	keys := make([]string, 0, len(rcs.classifiers))
-	for k := range rcs.classifiers {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func minSlice(slice []float64) float64 {
-	if len(slice) == 0 {
-		return math.Inf(1) // Return positive infinity if the slice is empty
-	}
-	min := slice[0]
-	for _, value := range slice {
-		if value < min {
-			min = value
-		}
-	}
-	return min
-}
-
-func average(slice []float64) float64 {
-	if len(slice) == 0 {
-		return 0
-	}
-	sum := 0.0
-	for _, value := range slice {
-		sum += value
-	}
-	return sum / float64(len(slice))
 }
 
 func NewResponse(time int, code int) Response {
