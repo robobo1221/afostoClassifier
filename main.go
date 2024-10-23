@@ -3,11 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"image/color"
-	"math"
 	"net/http"
 	"os"
-	"sort"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -16,50 +13,43 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	"gonum.org/v1/plot"
-	"gonum.org/v1/plot/plotter"
-	"gonum.org/v1/plot/vg"
 	classifier "robin.stik/server/classifier"
 	"robin.stik/server/database"
-	psqr "robin.stik/server/psqr"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 )
 
-var (
-	// Data for plotting
-	data                       = []float64{}
-	dataReal                   = []float64{}
-	errorRates                 = []float64{}
-	nRequest                   = 0
-	responses                  = []float64{}
-	scores                     = []float64{}
-	previousPercentile float64 = -1.
-)
+type TracingRoundTripper struct {
+	transport   http.RoundTripper
+	classifiers *classifier.ResponseClassifiers
+}
 
-func doRequest(uri string, connectionName string, w http.ResponseWriter, r *http.Request, classifiers *classifier.ResponseClassifiers, ctx context.Context) {
+func (t *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Get the tracer
 	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
-	ctx, span := tracer.Start(ctx, "HTTP GET "+uri)
+	ctx, span := tracer.Start(req.Context(), "HTTP "+req.Method+" "+req.URL.String())
 	defer span.End()
 
+	// Start measuring response time
 	timeStart := time.Now()
-	resp, err := http.Get(uri)
-
+	resp, err := t.transport.RoundTrip(req)
 	respTime := time.Since(timeStart).Milliseconds()
 
+	// Handle errors
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		return
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	span.SetStatus(codes.Ok, "Request successful")
 
-	go classifiers.DispatchWithParamsAndClassify(
+	// Dispatch the classifier in a goroutine
+	go t.classifiers.DispatchWithParamsAndClassify(
 		ctx,
-		connectionName,
+		req.URL.Host,
 		1.0,
 		true,
 		1000,
@@ -68,29 +58,42 @@ func doRequest(uri string, connectionName string, w http.ResponseWriter, r *http
 		resp.StatusCode,
 	)
 
-	// Name, integrationId,
+	return resp, nil
 }
 
-func sendRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	go func() {
-		for i := 0; i >= 0; i++ {
-			go doRequest("https://afosto.com", "afosto/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.bol.com/nl/nl", "bol/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.google.com/", "google/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.hanze.nl/nl", "hanze/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.shopify.com/", "shopify/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.x.com/", "twitter/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.glslsandbox.com/", "glslsandbox/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.shadertoy.com/", "shadertoy/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://www.startpagina.nl/", "startpagina/index", w, r, classifier.ResponseClassifiersInstance, ctx)
-			go doRequest("https://paradox.network/", "paradox/index", w, r, classifier.ResponseClassifiersInstance, ctx)
+func newTracingRoundTripper(classifiers *classifier.ResponseClassifiers) http.RoundTripper {
+	return &TracingRoundTripper{
+		transport:   http.DefaultTransport,
+		classifiers: classifiers,
+	}
+}
 
-			fmt.Println("Request", i)
+func sendRequest(ctx context.Context, client *http.Client) {
+	urls := []string{
+		"https://afosto.com",
+		"https://www.bol.com/nl/nl",
+		"https://www.google.com/",
+		"https://www.hanze.nl/nl",
+		"https://www.shopify.com/",
+		"https://www.x.com/",
+		"https://www.glslsandbox.com/",
+		"https://www.shadertoy.com/",
+		"https://www.startpagina.nl/",
+		"https://paradox.network/",
+	}
 
-			//time.Sleep((time.Duration(random.Int32N(950)) + 50) * time.Millisecond)
-			time.Sleep(1000 * time.Millisecond)
-		}
-	}()
+	for _, url := range urls {
+		go func(url string) {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				fmt.Printf("Error fetching %s: %v\n", url, err)
+				return
+			}
+			defer resp.Body.Close()
+		}(url)
+		time.Sleep(1 * time.Second) // Rate limiting the requests
+	}
 }
 
 func setupCollector(ctx context.Context) (*sdktrace.TracerProvider, *metric.MeterProvider, error) {
@@ -141,10 +144,13 @@ func main() {
 	database.InitSqlite()
 	database.Migrate()
 
-	// Set up HTTP handlers
-	http.HandleFunc("/graph", graphDatas)
+	// Create a new client with the custom RoundTripper
+	client := &http.Client{
+		Transport: newTracingRoundTripper(classifier.ResponseClassifiersInstance),
+	}
+
 	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
-		sendRequest(ctx, w, r)
+		sendRequest(ctx, client)
 	})
 
 	port := os.Getenv("PORT")
@@ -158,6 +164,7 @@ func main() {
 	}
 }
 
+/*
 func graphDatas(w http.ResponseWriter, r *http.Request) {
 	plotActualvsApproximated(dataReal, data, "data.png", "Data")
 	plotErrorRates(errorRates, "error.png", "Error")
@@ -394,3 +401,4 @@ func handleData(w http.ResponseWriter, classifier *classifier.ResponseClassifier
 	fmt.Fprintln(w, "Np:", np)
 	fmt.Fprintln(w, "Dn:", dn)
 }
+*/
