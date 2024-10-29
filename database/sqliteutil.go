@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	dbPath        = "./test.db"
-	migrationPath = "./migrations"
+	dbPath        = "./classifierData.db"
+	migrationPath = "./sqlitemigrations"
 	dbInstance    *sql.DB
 	once          sync.Once
 )

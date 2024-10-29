@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -310,14 +312,14 @@ func (rcs *ResponseClassifiers) DispatchWithParamsAndClassify(ctx context.Contex
 	if classifier, ok := rcs.classifiers[connection]; ok {
 		classifier.SetResponse(respTime, code)
 		classifier.Classify(ctx)
-		go rcs.RecordMetrics(ctx, classifier)
+		rcs.RecordMetrics(ctx, classifier)
 		return classifier // Return the pointer to the value
 	}
 
 	newClassifier := NewResponseClassifier(connection, maxPercentileMult, include4xx, windowSize, maxAbsoluteTime)
 	newClassifier.SetResponse(respTime, code)
 	newClassifier.Classify(ctx)
-	go rcs.RecordMetrics(ctx, newClassifier)
+	rcs.RecordMetrics(ctx, newClassifier)
 
 	rcs.classifiers[connection] = newClassifier
 
@@ -337,4 +339,55 @@ func (r *Response) GetTime() int {
 
 func (r *Response) GetCode() int {
 	return r.code
+}
+
+// Round tripper
+type ClassifierRoundTripper struct {
+	transport   http.RoundTripper
+	classifiers *ResponseClassifiers
+}
+
+func (t *ClassifierRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Get the tracer
+	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	ctx, span := tracer.Start(req.Context(), "HTTP "+req.Method+" "+req.URL.String())
+	defer span.End()
+
+	// Start measuring response time
+	timeStart := time.Now()
+	resp, err := t.transport.RoundTrip(req)
+	respTime := time.Since(timeStart).Milliseconds()
+
+	// Handle errors
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	span.SetStatus(codes.Ok, "Request successful")
+
+	// Dispatch the classifier in a goroutine
+	go t.classifiers.DispatchWithParamsAndClassify(
+		ctx,
+		req.URL.Host,
+		1.0,
+		true,
+		1000,
+		-1,
+		int(respTime),
+		resp.StatusCode,
+	)
+
+	fmt.Printf("classified %s %d %d\n", req.URL.Host, respTime, resp.StatusCode)
+
+	return resp, nil
+}
+
+func NewClassifierRoundTripper(classifiers *ResponseClassifiers) http.RoundTripper {
+	return &ClassifierRoundTripper{
+		transport:   http.DefaultTransport,
+		classifiers: classifiers,
+	}
 }

@@ -8,90 +8,43 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	classifier "robin.stik/server/classifier"
+	"robin.stik/server/classifier"
 	"robin.stik/server/database"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 )
 
-type TracingRoundTripper struct {
-	transport   http.RoundTripper
-	classifiers *classifier.ResponseClassifiers
-}
-
-func (t *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Get the tracer
-	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
-	ctx, span := tracer.Start(req.Context(), "HTTP "+req.Method+" "+req.URL.String())
-	defer span.End()
-
-	// Start measuring response time
-	timeStart := time.Now()
-	resp, err := t.transport.RoundTrip(req)
-	respTime := time.Since(timeStart).Milliseconds()
-
-	// Handle errors
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	span.SetStatus(codes.Ok, "Request successful")
-
-	// Dispatch the classifier in a goroutine
-	go t.classifiers.DispatchWithParamsAndClassify(
-		ctx,
-		req.URL.Host,
-		1.0,
-		true,
-		1000,
-		-1,
-		int(respTime),
-		resp.StatusCode,
-	)
-
-	return resp, nil
-}
-
-func newTracingRoundTripper(classifiers *classifier.ResponseClassifiers) http.RoundTripper {
-	return &TracingRoundTripper{
-		transport:   http.DefaultTransport,
-		classifiers: classifiers,
-	}
-}
-
 func sendRequest(ctx context.Context, client *http.Client) {
 	urls := []string{
 		"https://afosto.com",
-		"https://www.bol.com/nl/nl",
-		"https://www.google.com/",
-		"https://www.hanze.nl/nl",
-		"https://www.shopify.com/",
-		"https://www.x.com/",
-		"https://www.glslsandbox.com/",
-		"https://www.shadertoy.com/",
-		"https://www.startpagina.nl/",
-		"https://paradox.network/",
+		"https://google.com",
+		"https://facebook.com",
+		"https://twitter.com",
+		"https://instagram.com",
+		"https://linkedin.com",
+		"https://youtube.com",
+		"https://reddit.com",
+		"https://tiktok.com",
+		"https://netflix.com",
 	}
 
-	for _, url := range urls {
-		go func(url string) {
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				fmt.Printf("Error fetching %s: %v\n", url, err)
-				return
-			}
-			defer resp.Body.Close()
-		}(url)
+	for {
+		for _, url := range urls {
+			go func(url string) {
+				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+				resp, err := client.Do(req)
+				if err != nil {
+					fmt.Printf("Error fetching %s: %v\n", url, err)
+					return
+				}
+				defer resp.Body.Close()
+			}(url)
+		}
 		time.Sleep(1 * time.Second) // Rate limiting the requests
 	}
 }
@@ -118,7 +71,7 @@ func setupCollector(ctx context.Context) (*sdktrace.TracerProvider, *metric.Mete
 	)
 
 	mp := metric.NewMeterProvider(
-		metric.WithReader(metric.NewPeriodicReader(metricExp, metric.WithInterval(15*time.Second))),
+		metric.WithReader(metric.NewPeriodicReader(metricExp, metric.WithInterval(5*time.Second))),
 		metric.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String("testing-service"),
@@ -146,11 +99,11 @@ func main() {
 
 	// Create a new client with the custom RoundTripper
 	client := &http.Client{
-		Transport: newTracingRoundTripper(classifier.ResponseClassifiersInstance),
+		Transport: classifier.NewClassifierRoundTripper(classifier.ResponseClassifiersInstance),
 	}
 
 	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
-		sendRequest(ctx, client)
+		go sendRequest(ctx, client)
 	})
 
 	port := os.Getenv("PORT")
@@ -162,6 +115,7 @@ func main() {
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		fmt.Println("Error starting server:", err)
 	}
+
 }
 
 /*
