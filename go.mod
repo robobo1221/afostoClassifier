@@ -2,6 +2,8 @@ module github.com/robobo1221/afostoClassifier
 
 go 1.21.8
 
+toolchain go1.21.12
+
 require (
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.23.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.20.0
