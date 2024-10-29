@@ -7,13 +7,13 @@ import (
 	"os"
 	"time"
 
+	"github.com/robobo1221/afostoClassifier/classifier"
+	"github.com/robobo1221/afostoClassifier/database"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	"robin.stik/server/classifier"
-	"robin.stik/server/database"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"

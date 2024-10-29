@@ -1,4 +1,4 @@
-module robin.stik/server
+module github.com/robobo1221/afostoClassifier
 
 go 1.21.8
 

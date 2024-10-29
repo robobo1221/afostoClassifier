@@ -10,12 +10,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/robobo1221/afostoClassifier/database"
+	psqr "github.com/robobo1221/afostoClassifier/psqr"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
-	"robin.stik/server/database"
-	psqr "robin.stik/server/psqr"
 )
 
 var (
@@ -162,7 +162,7 @@ func (rc *ResponseClassifier) Classify(ctx context.Context) float64 {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
-	_, span := otel.GetTracerProvider().Tracer("robin.stik/server").Start(ctx, "Classify")
+	_, span := otel.GetTracerProvider().Tracer("connectionClassifier").Start(ctx, "Classify")
 	defer span.End()
 
 	// Classify response
@@ -231,7 +231,7 @@ func (rc *ResponseClassifier) Classify(ctx context.Context) float64 {
 }
 
 func (rcs *ResponseClassifiers) RecordMetrics(ctx context.Context, rc *ResponseClassifier) {
-	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	tracer := otel.GetTracerProvider().Tracer("connectionClassifier")
 	ctx, span := tracer.Start(ctx, "RecordMetrics")
 	defer span.End()
 
@@ -304,7 +304,7 @@ func NewResponseClassifiers() *ResponseClassifiers {
 }
 
 func (rcs *ResponseClassifiers) DispatchWithParamsAndClassify(ctx context.Context, connection string, maxPercentileMult float32, include4xx bool, windowSize int, maxAbsoluteTime int, respTime int, code int) *ResponseClassifier {
-	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	tracer := otel.GetTracerProvider().Tracer("connectionClassifier")
 	ctx, span := tracer.Start(ctx, "DispatchWithParamsAndClassify")
 	defer span.End()
 
@@ -349,7 +349,7 @@ type ClassifierRoundTripper struct {
 
 func (t *ClassifierRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Get the tracer
-	tracer := otel.GetTracerProvider().Tracer("robin.stik/server")
+	tracer := otel.GetTracerProvider().Tracer("connectionClassifier")
 	ctx, span := tracer.Start(req.Context(), "HTTP "+req.Method+" "+req.URL.String())
 	defer span.End()
 
